@@ -1,0 +1,26 @@
+TWITCH IPTV - RAILWAY EDITION
+==============================
+
+FILE DA CARICARE SU GITHUB:
+- server.py
+- streams.txt
+- requirements.txt
+- railway.json
+
+Railway assegna automaticamente la porta PORT.
+Dopo il deploy, genera un dominio pubblico da Settings > Networking > Generate Domain.
+
+Esempio:
+https://nome-app.up.railway.app/
+
+Playlist:
+https://nome-app.up.railway.app/playlist.m3u
+
+EPG:
+https://nome-app.up.railway.app/epg.xml
+
+Dashboard:
+https://nome-app.up.railway.app/
+
+Per cambiare gli streamer, modifica streams.txt su GitHub.
+Railway ridistribuirà automaticamente il progetto dopo il commit.
