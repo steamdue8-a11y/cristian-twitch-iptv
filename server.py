@@ -1,10 +1,11 @@
-from flask import Flask, request, Response, jsonify, render_template_string
+from flask import Flask, request, Response, jsonify, render_template_string, redirect, stream_with_context
 import subprocess
 import sys
 import os
 import json
 import time
 import re
+import requests
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from xml.sax.saxutils import escape
@@ -25,6 +26,75 @@ def public_base_url():
     proto = request.headers.get("X-Forwarded-Proto", request.scheme)
     host = request.headers.get("X-Forwarded-Host", request.host)
     return f"{proto}://{host}"
+
+
+# =========================================================
+# LIVE AD-FREE
+# =========================================================
+
+PROXY_CACHE_SECONDS = 45
+proxy_cache = {}
+proxy_http = requests.Session()
+proxy_http.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0 Safari/537.36"
+    )
+})
+
+
+def clean_proxy_candidates(streamer):
+    channel = quote(streamer, safe="")
+    params = "?allow_source=true&allow_audio_only=true&fast_bread=true"
+    encoded = (
+        f"{channel}.m3u8"
+        "%3Fplayer%3Dtwitchweb"
+        "%26type%3Dany"
+        "%26allow_source%3Dtrue"
+        "%26allow_audio_only%3Dtrue"
+        "%26allow_spectre%3Dfalse"
+        "%26fast_bread%3Dtrue"
+    )
+
+    # L'ordine conta: prima i proxy europei, poi gli altri fallback.
+    return [
+        ("Luminous EU", f"https://eu.luminous.dev/live/{channel}{params}"),
+        ("Luminous EU2", f"https://eu2.luminous.dev/live/{channel}{params}"),
+        ("PerfProd EU", f"https://lb-eu.cdn-perfprod.com/playlist/{encoded}"),
+        ("PerfProd EU2", f"https://lb-eu2.cdn-perfprod.com/playlist/{encoded}"),
+        ("Luminous AS", f"https://as.luminous.dev/live/{channel}{params}"),
+    ]
+
+
+def get_clean_proxy(streamer, force=False):
+    key = streamer.lower()
+    now = time.time()
+    cached = proxy_cache.get(key)
+    if cached and not force and now - cached["time"] < PROXY_CACHE_SECONDS:
+        return cached["result"]
+
+    selected = None
+    for name, url in clean_proxy_candidates(streamer):
+        try:
+            r = proxy_http.get(url, timeout=(3.0, 6.0), allow_redirects=True)
+            body = r.text[:250000]
+            if r.status_code != 200 or "#EXTM3U" not in body:
+                continue
+
+            lower = body.lower()
+            # Se il manifest restituito è già marcato come stitched-ad,
+            # non lo consideriamo un backend pulito.
+            if "twitch-stitched-ad" in lower or "stitched-ad-" in lower:
+                continue
+
+            selected = {"name": name, "url": url}
+            break
+        except requests.RequestException:
+            continue
+
+    proxy_cache[key] = {"time": now, "result": selected}
+    return selected
 
 
 def safe_console(text):
@@ -229,16 +299,39 @@ def api_channel(streamer):
 def api_play(streamer):
     if not allowed_streamer(streamer):
         return jsonify({"error": "Canale non presente in streams.txt"}), 404
+
     info = resolve_channel(streamer, force=True)
     if info["status"] == "OFFLINE" or not info.get("stream_url"):
         return jsonify({"error": "Nessuna live o VOD disponibile", "status": "OFFLINE"}), 404
+
+    play_url = info["stream_url"]
+    adfree = False
+    method = "DIRECT"
+
+    if info["status"] == "LIVE":
+        clean = get_clean_proxy(streamer, force=True)
+        if clean:
+            play_url = clean["url"]
+            adfree = True
+            method = clean["name"]
+            safe_console(f"[LIVE CLEAN] {streamer} -> {method}")
+        else:
+            # Streamlink filtra gli ad segment. Durante un break, se non esiste
+            # un flusso pulito alternativo, l'immagine può fermarsi finché torna la live.
+            play_url = f"{public_base_url()}/relay/{quote(streamer)}"
+            adfree = True
+            method = "Streamlink filtered"
+            safe_console(f"[LIVE FILTERED] {streamer} -> Streamlink")
+
     return jsonify({
         "streamer": streamer,
         "status": info["status"],
         "title": info["title"],
         "date": info["date"],
         "thumbnail": info["thumbnail"],
-        "url": info["stream_url"],
+        "url": play_url,
+        "adfree": adfree,
+        "method": method,
     })
 
 
@@ -247,16 +340,81 @@ def twitch_compat():
     streamer = request.args.get("streamer", "").strip()
     if not streamer or not allowed_streamer(streamer):
         return "Streamer non valido", 404
+
     info = resolve_channel(streamer, force=True)
     if info["status"] == "OFFLINE" or not info.get("stream_url"):
         return "Nessuna live o VOD disponibile", 404
-    safe_console(f"[{info['status']}] {streamer}")
-    manifest = (
-        "#EXTM3U\n"
-        "#EXT-X-STREAM-INF:BANDWIDTH=8000000\n"
-        f"{info['stream_url']}\n"
+
+    # Per le VOD non serve il proxy anti-ad.
+    if info["status"] != "LIVE":
+        safe_console(f"[{info['status']}] {streamer}")
+        manifest = (
+            "#EXTM3U\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=8000000\n"
+            f"{info['stream_url']}\n"
+        )
+        return Response(manifest, mimetype="application/vnd.apple.mpegurl")
+
+    # LIVE: prova prima più backend che restituiscono una playlist pulita.
+    clean = get_clean_proxy(streamer, force=True)
+    if clean:
+        safe_console(f"[LIVE CLEAN] {streamer} -> {clean['name']}")
+        return redirect(clean["url"], code=302)
+
+    # Ultimo paracadute: Streamlink filtra gli ad segment. Non mostra lo spot,
+    # ma può esserci un freeze durante il commercial break.
+    safe_console(f"[LIVE FILTERED] {streamer} -> Streamlink")
+    return redirect(f"{public_base_url()}/relay/{quote(streamer)}", code=302)
+
+
+@app.route("/relay/<path:streamer>")
+def relay(streamer):
+    if not allowed_streamer(streamer):
+        return "Streamer non valido", 404
+
+    twitch_url = f"https://www.twitch.tv/{streamer}"
+    command = [
+        sys.executable,
+        "-m",
+        "streamlink",
+        "--stdout",
+        "--loglevel", "warning",
+        "--retry-open", "2",
+        "--stream-segment-attempts", "3",
+        "--stream-segment-timeout", "10",
+        twitch_url,
+        "best",
+    ]
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
     )
-    return Response(manifest, mimetype="application/vnd.apple.mpegurl")
+
+    def generate():
+        try:
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="video/mp4",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.route("/playlist.m3u")
@@ -352,7 +510,7 @@ button,input{font:inherit}.app{display:grid;grid-template-columns:290px 1fr;heig
   </aside>
 
   <main class="main">
-    <div class="topbar"><div class="topTitle">Twitch IPTV</div><div class="topActions"><button class="btn" onclick="copyText('http://{{base}}/playlist.m3u','Playlist copiata')">Copia M3U</button><button class="btn" onclick="copyText('http://{{base}}/epg.xml','EPG copiata')">Copia EPG</button><button class="btn primary" onclick="refreshAll(true)">Aggiorna</button></div></div>
+    <div class="topbar"><div class="topTitle">Twitch IPTV</div><div class="topActions"><button class="btn" onclick="copyText('{{base}}/playlist.m3u','Playlist copiata')">Copia M3U</button><button class="btn" onclick="copyText('{{base}}/epg.xml','EPG copiata')">Copia EPG</button><button class="btn primary" onclick="refreshAll(true)">Aggiorna</button></div></div>
 
     <div class="content">
       <section class="hero">
@@ -411,6 +569,7 @@ async function playChannel(encoded){
 }
 function startVideo(url){
  const video=el('video'); stopVideo(false); el('playerEmpty').classList.add('hidden');
+ if(url.includes('/relay/')){video.src=url; video.play().catch(()=>{}); return}
  if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=url; video.play().catch(()=>{}); return}
  if(window.Hls&&Hls.isSupported()){hls=new Hls({enableWorker:true,lowLatencyMode:true,maxBufferLength:25}); hls.loadSource(url); hls.attachMedia(video); hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{})); hls.on(Hls.Events.ERROR,(event,data)=>{if(data.fatal){if(data.type===Hls.ErrorTypes.NETWORK_ERROR){hls.startLoad()}else if(data.type===Hls.ErrorTypes.MEDIA_ERROR){hls.recoverMediaError()}else{toast('Player','Errore HLS');}}}); return}
  video.src=url; video.play().catch(()=>{});

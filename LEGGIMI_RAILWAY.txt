@@ -1,26 +1,28 @@
-TWITCH IPTV - RAILWAY EDITION
-==============================
+TWITCH IPTV - RAILWAY + AD-FREE
+=================================
 
-FILE DA CARICARE SU GITHUB:
-- server.py
-- streams.txt
-- requirements.txt
-- railway.json
+Questa versione include:
+- UI Twitch IPTV
+- M3U + EPG
+- LIVE Twitch
+- REPLAY automatico con ultima VOD
+- proxy anti-ad con più fallback
+- Streamlink come ultimo paracadute (filtra gli spot; può fermarsi durante il break)
+- compatibilità Railway
 
-Railway assegna automaticamente la porta PORT.
-Dopo il deploy, genera un dominio pubblico da Settings > Networking > Generate Domain.
+CARICAMENTO:
+1. Su GitHub apri il repository già collegato a Railway.
+2. Sostituisci server.py, requirements.txt, railway.json, streams.txt.
+3. Commit changes.
+4. Railway farà il redeploy automaticamente.
 
-Esempio:
-https://nome-app.up.railway.app/
-
-Playlist:
-https://nome-app.up.railway.app/playlist.m3u
+IL LINK IPTV NON CAMBIA:
+https://cristian-twitch-iptv-production.up.railway.app/playlist.m3u
 
 EPG:
-https://nome-app.up.railway.app/epg.xml
+https://cristian-twitch-iptv-production.up.railway.app/epg.xml
 
-Dashboard:
-https://nome-app.up.railway.app/
-
-Per cambiare gli streamer, modifica streams.txt su GitHub.
-Railway ridistribuirà automaticamente il progetto dopo il commit.
+LOG UTILI:
+[LIVE CLEAN] = proxy ad-free selezionato
+[LIVE FILTERED] = i proxy non rispondono; usa Streamlink e non mostra gli spot, ma può esserci un freeze
+[REPLAY] = ultima VOD

@@ -1,3 +1,5 @@
 flask
 yt-dlp
 gunicorn
+requests
+streamlink>=8.5.0

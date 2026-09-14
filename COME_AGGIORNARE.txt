@@ -1,0 +1,39 @@
+TWITCH IPTV - RAILWAY AD-FREE
+=================================
+
+NON DEVI CREARE UN NUOVO PROGETTO RAILWAY.
+NON DEVI CAMBIARE IL LINK NELL'IPTV.
+
+COME AGGIORNARE:
+1. Estrai questo ZIP.
+2. Apri su GitHub il repository "cristian-twitch-iptv".
+3. Carica/sostituisci questi file:
+   - server.py
+   - requirements.txt
+   - railway.json
+   - streams.txt
+4. Conferma "Commit changes".
+5. Railway rileverà il commit e farà automaticamente il redeploy.
+6. Aspetta che il deployment diventi SUCCESS / ACTIVE.
+
+IL TUO LINK IPTV RESTA:
+https://cristian-twitch-iptv-production.up.railway.app/playlist.m3u
+
+EPG:
+https://cristian-twitch-iptv-production.up.railway.app/epg.xml
+
+UI:
+https://cristian-twitch-iptv-production.up.railway.app/
+
+COME FUNZIONA LA LIVE:
+- Prima prova più proxy HLS ad-free.
+- Se un proxy pulito risponde: nei log appare [LIVE CLEAN].
+- Se tutti i proxy falliscono: usa Streamlink come paracadute.
+  Streamlink filtra gli spot; durante il commercial break può esserci un freeze
+  invece della pubblicità.
+- Se lo streamer è offline: parte automaticamente l'ultima VOD.
+
+NOTE:
+- I proxy community possono cambiare o smettere di funzionare nel tempo.
+- La qualità "source" viene richiesta quando disponibile.
+- Streamlink viene usato solo come fallback, perché il relay passa dal server Railway.
