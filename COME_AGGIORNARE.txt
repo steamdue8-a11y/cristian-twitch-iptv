@@ -1,39 +1,28 @@
-TWITCH IPTV - RAILWAY AD-FREE
-=================================
+AGGIORNAMENTO STREAMINGCOMMUNITY - CATALOGO
+===========================================
 
-NON DEVI CREARE UN NUOVO PROGETTO RAILWAY.
-NON DEVI CAMBIARE IL LINK NELL'IPTV.
-
-COME AGGIORNARE:
-1. Estrai questo ZIP.
-2. Apri su GitHub il repository "cristian-twitch-iptv".
-3. Carica/sostituisci questi file:
+1) Sostituisci su GitHub:
    - server.py
    - requirements.txt
-   - railway.json
-   - streams.txt
-4. Conferma "Commit changes".
-5. Railway rileverà il commit e farà automaticamente il redeploy.
-6. Aspetta che il deployment diventi SUCCESS / ACTIVE.
 
-IL TUO LINK IPTV RESTA:
-https://cristian-twitch-iptv-production.up.railway.app/playlist.m3u
+2) Su Railway apri il servizio > Variables e aggiungi:
+   SC_DOMAIN = [il dominio che usi con streamingcommunity-unofficialapi]
 
-EPG:
-https://cristian-twitch-iptv-production.up.railway.app/epg.xml
+3) Fai Deploy Latest Commit.
 
-UI:
-https://cristian-twitch-iptv-production.up.railway.app/
+4) Apri:
+   https://TUO-DOMINIO-RAILWAY/catalogo
 
-COME FUNZIONA LA LIVE:
-- Prima prova più proxy HLS ad-free.
-- Se un proxy pulito risponde: nei log appare [LIVE CLEAN].
-- Se tutti i proxy falliscono: usa Streamlink come paracadute.
-  Streamlink filtra gli spot; durante il commercial break può esserci un freeze
-  invece della pubblicità.
-- Se lo streamer è offline: parte automaticamente l'ultima VOD.
+La pagina Twitch rimane invariata e ha un nuovo pulsante "Catalogo".
 
-NOTE:
-- I proxy community possono cambiare o smettere di funzionare nel tempo.
-- La qualità "source" viene richiesta quando disponibile.
-- Streamlink viene usato solo come fallback, perché il relay passa dal server Railway.
+Questa build integra search() e load() della unofficial API:
+- ricerca
+- schede
+- trama
+- anno
+- tag
+- stagioni
+- lista episodi
+- trailer YouTube quando disponibile
+
+Non usa get_links() e non estrae playlist video.

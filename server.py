@@ -7,9 +7,14 @@ import time
 import re
 import requests
 from datetime import datetime, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from xml.sax.saxutils import escape
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    from scuapi import API as StreamingCommunityAPI
+except Exception:
+    StreamingCommunityAPI = None
 
 PORT = int(os.environ.get("PORT", "9001"))
 CACHE_SECONDS = 75
@@ -17,6 +22,27 @@ MAX_WORKERS = 6
 
 app = Flask(__name__)
 channel_cache = {}
+
+# =========================================================
+# STREAMINGCOMMUNITY - CATALOGO / METADATI
+# =========================================================
+# Su Railway imposta una variabile:
+# SC_DOMAIN = il dominio che vuoi usare con streamingcommunity-unofficialapi
+#
+# Questa integrazione usa search() e load() per catalogo, schede,
+# stagioni ed episodi. Non estrae URL video o playlist di playback.
+SC_DOMAIN = os.environ.get("SC_DOMAIN", "").strip()
+SC_DOMAIN = re.sub(r"^https?://", "", SC_DOMAIN, flags=re.I).strip().strip("/")
+SC_CACHE_SECONDS = 120
+sc_search_cache = {}
+
+if StreamingCommunityAPI is not None and SC_DOMAIN:
+    try:
+        sc_client = StreamingCommunityAPI(SC_DOMAIN)
+    except Exception:
+        sc_client = None
+else:
+    sc_client = None
 
 
 def public_base_url():
@@ -242,6 +268,173 @@ def channel_for_api(streamer, force=False):
     public.pop("stream_url", None)
     public["play_url"] = f"/api/play/{quote(streamer)}"
     return public
+
+
+
+def sc_require_client():
+    if StreamingCommunityAPI is None:
+        raise RuntimeError(
+            "Pacchetto streamingcommunity-unofficialapi non installato"
+        )
+    if not SC_DOMAIN:
+        raise RuntimeError(
+            "SC_DOMAIN non configurato nelle Variables di Railway"
+        )
+    if sc_client is None:
+        raise RuntimeError(
+            "Impossibile inizializzare streamingcommunity-unofficialapi"
+        )
+    return sc_client
+
+
+def sc_item_ref(item):
+    """Crea un riferimento stabile accettato da API.load()."""
+    if not isinstance(item, dict):
+        return ""
+
+    raw_url = str(item.get("url") or "").strip()
+    if raw_url:
+        try:
+            path = urlparse(raw_url).path.rstrip("/")
+            last = path.rsplit("/", 1)[-1]
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,180}", last):
+                return last
+        except Exception:
+            pass
+
+    item_id = str(item.get("id") or "").strip()
+    slug = str(item.get("slug") or "").strip()
+
+    if item_id and slug:
+        ref = f"{item_id}-{slug}"
+    else:
+        ref = item_id or slug
+
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,180}", ref or ""):
+        return ref
+    return ""
+
+
+def sc_search_normalized(query):
+    client = sc_require_client()
+    key = query.casefold()
+    now = time.time()
+
+    cached = sc_search_cache.get(key)
+    if cached and now - cached["time"] < SC_CACHE_SECONDS:
+        return cached["items"]
+
+    raw = client.search(query)
+    items = []
+
+    if isinstance(raw, dict):
+        iterable = raw.items()
+    elif isinstance(raw, list):
+        iterable = [(None, x) for x in raw]
+    else:
+        iterable = []
+
+    for fallback_name, value in iterable:
+        if not isinstance(value, dict):
+            continue
+
+        ref = sc_item_ref(value)
+        if not ref:
+            continue
+
+        items.append({
+            "ref": ref,
+            "id": value.get("id"),
+            "name": value.get("name") or fallback_name or "Senza titolo",
+            "type": value.get("type") or "",
+            "score": value.get("score"),
+            "last_air_date": value.get("last_air_date"),
+            "seasons_count": value.get("seasons_count") or 0,
+        })
+
+    sc_search_cache[key] = {"time": now, "items": items}
+    return items
+
+
+def sc_detail_normalized(ref):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,180}", ref or ""):
+        raise RuntimeError("Riferimento non valido")
+
+    client = sc_require_client()
+    raw = client.load(ref)
+
+    if not isinstance(raw, dict):
+        raise RuntimeError("La API non ha restituito una scheda valida")
+
+    episodes = []
+    for ep in raw.get("episodeList") or []:
+        if not isinstance(ep, dict):
+            continue
+        episodes.append({
+            "name": ep.get("name") or "",
+            "season": ep.get("season"),
+            "episode": ep.get("episode"),
+            "description": ep.get("description") or "",
+            "duration": ep.get("duration"),
+        })
+
+    trailer = raw.get("trailerUrl") or ""
+    if trailer and not str(trailer).lower().startswith(
+        ("https://youtube.com/", "https://www.youtube.com/", "https://youtu.be/")
+    ):
+        trailer = ""
+
+    return {
+        "ref": ref,
+        "id": raw.get("id"),
+        "name": raw.get("name") or "Senza titolo",
+        "type": raw.get("type") or "",
+        "year": raw.get("year"),
+        "plot": raw.get("plot") or "",
+        "tmdb_id": raw.get("tmdb_id"),
+        "imdb_id": raw.get("imdb_id"),
+        "release_date": raw.get("release_date"),
+        "rating": raw.get("rating"),
+        "tags": raw.get("tags") or [],
+        "duration": raw.get("duration"),
+        "seasons_count": raw.get("seasons_count") or 0,
+        "trailerUrl": trailer,
+        "episodes": episodes,
+    }
+
+
+@app.route("/api/sc/status")
+def api_sc_status():
+    return jsonify({
+        "installed": StreamingCommunityAPI is not None,
+        "configured": bool(SC_DOMAIN and sc_client is not None),
+        "domain_configured": bool(SC_DOMAIN),
+    })
+
+
+@app.route("/api/sc/search")
+def api_sc_search():
+    query = request.args.get("q", "").strip()
+    if len(query) < 2:
+        return jsonify({"items": [], "error": "Scrivi almeno 2 caratteri"}), 400
+
+    try:
+        return jsonify({"items": sc_search_normalized(query)})
+    except Exception as exc:
+        return jsonify({"items": [], "error": str(exc)}), 503
+
+
+@app.route("/api/sc/detail/<path:ref>")
+def api_sc_detail(ref):
+    try:
+        return jsonify(sc_detail_normalized(ref))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 503
+
+
+@app.route("/catalogo")
+def catalogo():
+    return render_template_string(CATALOG_HTML)
 
 
 @app.after_request
@@ -482,6 +675,114 @@ def health():
     return jsonify({"ok": True, "base": public_base_url(), "port": PORT, "channels": len(read_streamers())})
 
 
+
+CATALOG_HTML = r"""<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Catalogo · Cristian TV</title>
+<style>
+:root{--bg:#0e0e10;--panel:#18181b;--panel2:#1f1f23;--line:#2f2f35;--text:#efeff1;--muted:#adadb8;--purple:#9147ff;--purple2:#772ce8}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+header{height:68px;display:flex;align-items:center;justify-content:space-between;padding:0 22px;border-bottom:1px solid #26262c;background:#18181b;position:sticky;top:0;z-index:10}
+.brand{display:flex;align-items:center;gap:12px;font-weight:850}.mark{width:35px;height:35px;border-radius:10px;background:linear-gradient(145deg,var(--purple),#bf94ff);display:grid;place-items:center}
+button,a{font:inherit}.btn{border:0;border-radius:9px;padding:10px 13px;background:#2f2f35;color:white;font-weight:700;cursor:pointer;text-decoration:none}.btn:hover{background:#3a3a41}.btn.primary{background:var(--purple)}.btn.primary:hover{background:var(--purple2)}
+main{max-width:1180px;margin:auto;padding:28px 20px 60px}.hero h1{margin:0 0 7px;font-size:29px}.hero p{margin:0;color:var(--muted)}
+.search{display:grid;grid-template-columns:1fr auto;gap:10px;margin-top:23px}.search input{min-width:0;background:#18181b;color:white;border:1px solid #34343c;border-radius:11px;padding:14px 15px;outline:0;font-size:16px}.search input:focus{border-color:var(--purple)}
+.status{margin-top:12px;color:var(--muted);font-size:13px}.status.bad{color:#ff8280}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin-top:22px}.card{border:1px solid #292930;background:var(--panel);border-radius:13px;padding:16px;cursor:pointer;transition:.15s;min-height:145px}.card:hover{transform:translateY(-2px);border-color:#555561}.type{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:#bf94ff;font-weight:850}.title{font-size:18px;font-weight:800;margin-top:9px}.meta{color:var(--muted);font-size:12px;margin-top:7px;line-height:1.55}.score{display:inline-block;margin-top:12px;background:#2b2140;padding:5px 7px;border-radius:6px;font-size:11px;font-weight:800}
+.empty{margin-top:28px;padding:28px;border:1px dashed #383842;border-radius:13px;color:var(--muted);text-align:center}
+.modal{position:fixed;inset:0;background:#000b;display:none;align-items:center;justify-content:center;padding:18px;z-index:30}.modal.show{display:flex}.sheet{width:min(820px,100%);max-height:90vh;overflow:auto;background:#18181b;border:1px solid #373740;border-radius:16px;padding:22px;box-shadow:0 30px 100px #000}.sheetTop{display:flex;justify-content:space-between;gap:20px}.sheet h2{margin:0;font-size:25px}.close{background:#2f2f35;border:0;color:white;width:36px;height:36px;border-radius:9px;cursor:pointer}.pills{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.pill{background:#29292f;border-radius:999px;padding:6px 9px;font-size:11px;color:#d4d4dc}.plot{line-height:1.65;color:#d6d6dc;margin-top:18px}.episodes{margin-top:22px}.episodes h3{margin:0 0 10px}.ep{padding:11px 0;border-top:1px solid #2c2c33}.epName{font-weight:750}.epMeta{font-size:12px;color:var(--muted);margin-top:4px}.epDesc{font-size:13px;color:#c6c6ce;margin-top:7px;line-height:1.5}
+.notice{margin-top:18px;border:1px solid #3b3150;background:#21172f;border-radius:10px;padding:12px 13px;color:#d9c9f8;font-size:12px;line-height:1.5}
+@media(max-width:600px){header{padding:0 13px}.brand span:last-child{display:none}main{padding:20px 12px 50px}.search{grid-template-columns:1fr}.grid{grid-template-columns:1fr 1fr}.card{padding:12px}.title{font-size:15px}}@media(max-width:420px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><div class="mark">C</div><span>Catalogo · Cristian TV</span></div>
+  <a class="btn" href="/">Torna a Twitch</a>
+</header>
+<main>
+  <section class="hero">
+    <h1>Cerca nel catalogo</h1>
+    <p>Ricerca, schede, stagioni ed episodi tramite streamingcommunity-unofficialapi.</p>
+    <div class="search">
+      <input id="q" autocomplete="off" placeholder="Cerca un film o una serie…">
+      <button class="btn primary" onclick="searchCatalog()">Cerca</button>
+    </div>
+    <div id="status" class="status">Controllo configurazione…</div>
+  </section>
+  <section id="results" class="grid"></section>
+  <div id="empty" class="empty">Scrivi un titolo per iniziare.</div>
+</main>
+
+<div id="modal" class="modal" onclick="if(event.target===this)closeModal()">
+  <div class="sheet">
+    <div class="sheetTop"><div><div class="type" id="dType"></div><h2 id="dName"></h2></div><button class="close" onclick="closeModal()">×</button></div>
+    <div class="pills" id="dPills"></div>
+    <div class="plot" id="dPlot"></div>
+    <div id="dTrailer"></div>
+    <div class="episodes" id="dEpisodes"></div>
+    <div class="notice">Questa sezione usa l'API non ufficiale per ricerca e metadati. Il playback non viene estratto da questa integrazione.</div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+async function checkStatus(){
+  try{
+    const r=await fetch('/api/sc/status',{cache:'no-store'}), d=await r.json();
+    if(d.configured){$('status').textContent='Catalogo pronto.';$('status').className='status'}
+    else{
+      $('status').textContent=d.installed?'Imposta SC_DOMAIN nelle Variables di Railway.':'Manca streamingcommunity-unofficialapi in requirements.txt.';
+      $('status').className='status bad';
+    }
+  }catch{$('status').textContent='Impossibile controllare il catalogo.';$('status').className='status bad'}
+}
+async function searchCatalog(){
+  const q=$('q').value.trim(); if(q.length<2)return;
+  $('status').textContent='Ricerca in corso…'; $('status').className='status';
+  $('empty').style.display='none'; $('results').innerHTML='';
+  try{
+    const r=await fetch('/api/sc/search?q='+encodeURIComponent(q),{cache:'no-store'}), d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Errore ricerca');
+    const items=d.items||[];
+    $('status').textContent=items.length?`${items.length} risultati`:'Nessun risultato';
+    $('results').innerHTML=items.map(x=>`
+      <article class="card" onclick="openDetail('${encodeURIComponent(x.ref)}')">
+        <div class="type">${esc(x.type||'titolo')}</div>
+        <div class="title">${esc(x.name)}</div>
+        <div class="meta">${x.last_air_date?esc(x.last_air_date):''}${x.seasons_count?` · ${x.seasons_count} stagioni`:''}</div>
+        ${x.score?`<span class="score">★ ${esc(x.score)}</span>`:''}
+      </article>`).join('');
+    if(!items.length){$('empty').style.display='block';$('empty').textContent='Nessun risultato trovato.'}
+  }catch(e){$('status').textContent=e.message;$('status').className='status bad';$('empty').style.display='block';$('empty').textContent='Ricerca non disponibile.'}
+}
+async function openDetail(encoded){
+  const ref=decodeURIComponent(encoded); $('modal').classList.add('show');
+  $('dType').textContent=''; $('dName').textContent='Caricamento…'; $('dPills').innerHTML=''; $('dPlot').textContent=''; $('dEpisodes').innerHTML=''; $('dTrailer').innerHTML='';
+  try{
+    const r=await fetch('/api/sc/detail/'+encodeURIComponent(ref),{cache:'no-store'}), d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Errore scheda');
+    $('dType').textContent=d.type||'Titolo'; $('dName').textContent=d.name||'Senza titolo'; $('dPlot').textContent=d.plot||'Nessuna trama disponibile.';
+    const pills=[];
+    if(d.year)pills.push(String(d.year)); if(d.duration)pills.push(d.duration+' min'); if(d.seasons_count)pills.push(d.seasons_count+' stagioni');
+    (d.tags||[]).forEach(t=>pills.push(t)); $('dPills').innerHTML=pills.map(p=>`<span class="pill">${esc(p)}</span>`).join('');
+    if(d.trailerUrl)$('dTrailer').innerHTML=`<p><a class="btn" target="_blank" rel="noopener" href="${esc(d.trailerUrl)}">Guarda trailer</a></p>`;
+    const eps=d.episodes||[];
+    if(eps.length){
+      $('dEpisodes').innerHTML='<h3>Episodi</h3>'+eps.map(e=>`<div class="ep"><div class="epName">S${String(e.season??'?').padStart(2,'0')}E${String(e.episode??'?').padStart(2,'0')} · ${esc(e.name||'Episodio')}</div><div class="epMeta">${e.duration?esc(e.duration)+' min':''}</div>${e.description?`<div class="epDesc">${esc(e.description)}</div>`:''}</div>`).join('');
+    }
+  }catch(e){$('dName').textContent='Errore';$('dPlot').textContent=e.message}
+}
+function closeModal(){$('modal').classList.remove('show')}
+$('q').addEventListener('keydown',e=>{if(e.key==='Enter')searchCatalog()});
+checkStatus();
+</script>
+</body>
+</html>"""
+
 APP_HTML = r'''<!doctype html>
 <html lang="it">
 <head>
@@ -510,7 +811,7 @@ button,input{font:inherit}.app{display:grid;grid-template-columns:290px 1fr;heig
   </aside>
 
   <main class="main">
-    <div class="topbar"><div class="topTitle">Twitch IPTV</div><div class="topActions"><button class="btn" onclick="copyText('{{base}}/playlist.m3u','Playlist copiata')">Copia M3U</button><button class="btn" onclick="copyText('{{base}}/epg.xml','EPG copiata')">Copia EPG</button><button class="btn primary" onclick="refreshAll(true)">Aggiorna</button></div></div>
+    <div class="topbar"><div class="topTitle">Twitch IPTV</div><div class="topActions"><button class="btn" onclick="location.href='/catalogo'">Catalogo</button><button class="btn" onclick="copyText('{{base}}/playlist.m3u','Playlist copiata')">Copia M3U</button><button class="btn" onclick="copyText('{{base}}/epg.xml','EPG copiata')">Copia EPG</button><button class="btn primary" onclick="refreshAll(true)">Aggiorna</button></div></div>
 
     <div class="content">
       <section class="hero">

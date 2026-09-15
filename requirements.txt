@@ -1,5 +1,6 @@
 flask
-yt-dlp
-gunicorn
 requests
-streamlink>=8.5.0
+yt-dlp
+streamlink
+gunicorn
+streamingcommunity-unofficialapi==4.0.2
