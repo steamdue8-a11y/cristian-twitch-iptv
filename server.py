@@ -36,6 +36,19 @@ SC_DOMAIN = re.sub(r"^https?://", "", SC_DOMAIN, flags=re.I).strip().strip("/")
 SC_CACHE_SECONDS = 120
 sc_search_cache = {}
 
+# =========================================================
+# PLAYBACK AUTOMATICO - SORGENTE CONFIGURABILE
+# =========================================================
+# Per sicurezza questa build NON estrae stream da get_links().
+# Se hai un resolver di playback che sei autorizzato a usare, imposta:
+# PLAYBACK_RESOLVER_URL=https://tuo-resolver.example/resolve
+#
+# Il server gli invia JSON con:
+# ref, media_id, tmdb_id, imdb_id, name, type, season, episode
+# e si aspetta JSON: {"url": "https://..."}
+PLAYBACK_RESOLVER_URL = os.environ.get("PLAYBACK_RESOLVER_URL", "").strip()
+PLAYBACK_TIMEOUT = 20
+
 if StreamingCommunityAPI is not None and SC_DOMAIN:
     try:
         sc_client = StreamingCommunityAPI(SC_DOMAIN)
@@ -403,12 +416,100 @@ def sc_detail_normalized(ref):
     }
 
 
+
+def resolve_playback_url(media, season=None, episode=None):
+    """
+    Risolve automaticamente il playback attraverso un resolver esterno
+    configurabile. Non usa get_links() né estrae URL da fonti non autorizzate.
+    """
+    if not PLAYBACK_RESOLVER_URL:
+        raise RuntimeError(
+            "Playback non configurato: imposta PLAYBACK_RESOLVER_URL nelle Variables di Railway"
+        )
+
+    payload = {
+        "ref": media.get("ref"),
+        "media_id": media.get("id"),
+        "tmdb_id": media.get("tmdb_id"),
+        "imdb_id": media.get("imdb_id"),
+        "name": media.get("name"),
+        "type": media.get("type"),
+        "season": season,
+        "episode": episode,
+    }
+
+    r = requests.post(
+        PLAYBACK_RESOLVER_URL,
+        json=payload,
+        timeout=PLAYBACK_TIMEOUT,
+        allow_redirects=True,
+        headers={"User-Agent": "Cristian-TV/1.0"},
+    )
+
+    if r.status_code >= 400:
+        raise RuntimeError(f"Resolver playback: HTTP {r.status_code}")
+
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError("Il resolver playback non ha restituito JSON valido")
+
+    url = str(data.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise RuntimeError("Il resolver playback non ha restituito un URL valido")
+
+    return url
+
+
+@app.route("/api/media/play")
+def api_media_play():
+    ref = request.args.get("ref", "").strip()
+    season = request.args.get("season")
+    episode = request.args.get("episode")
+
+    if not ref:
+        return jsonify({"error": "Contenuto mancante"}), 400
+
+    try:
+        media = sc_detail_normalized(ref)
+
+        if season not in (None, ""):
+            season = int(season)
+        else:
+            season = None
+
+        if episode not in (None, ""):
+            episode = int(episode)
+        else:
+            episode = None
+
+        url = resolve_playback_url(
+            media=media,
+            season=season,
+            episode=episode,
+        )
+
+        return jsonify({
+            "url": url,
+            "name": media.get("name"),
+            "type": media.get("type"),
+            "season": season,
+            "episode": episode,
+        })
+
+    except ValueError:
+        return jsonify({"error": "Stagione o episodio non validi"}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 503
+
+
 @app.route("/api/sc/status")
 def api_sc_status():
     return jsonify({
         "installed": StreamingCommunityAPI is not None,
         "configured": bool(SC_DOMAIN and sc_client is not None),
         "domain_configured": bool(SC_DOMAIN),
+        "playback_configured": bool(PLAYBACK_RESOLVER_URL),
     })
 
 
@@ -672,7 +773,7 @@ def epg():
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "base": public_base_url(), "port": PORT, "channels": len(read_streamers())})
+    return jsonify({"ok": True, "base": public_base_url(), "port": PORT, "channels": len(read_streamers()), "catalog_playback": bool(PLAYBACK_RESOLVER_URL)})
 
 
 
@@ -682,6 +783,7 @@ CATALOG_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Catalogo · Cristian TV</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <style>
 :root{--bg:#0e0e10;--panel:#18181b;--panel2:#1f1f23;--line:#2f2f35;--text:#efeff1;--muted:#adadb8;--purple:#9147ff;--purple2:#772ce8}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
@@ -692,7 +794,7 @@ main{max-width:1180px;margin:auto;padding:28px 20px 60px}.hero h1{margin:0 0 7px
 .search{display:grid;grid-template-columns:1fr auto;gap:10px;margin-top:23px}.search input{min-width:0;background:#18181b;color:white;border:1px solid #34343c;border-radius:11px;padding:14px 15px;outline:0;font-size:16px}.search input:focus{border-color:var(--purple)}
 .status{margin-top:12px;color:var(--muted);font-size:13px}.status.bad{color:#ff8280}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin-top:22px}.card{border:1px solid #292930;background:var(--panel);border-radius:13px;padding:16px;cursor:pointer;transition:.15s;min-height:145px}.card:hover{transform:translateY(-2px);border-color:#555561}.type{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:#bf94ff;font-weight:850}.title{font-size:18px;font-weight:800;margin-top:9px}.meta{color:var(--muted);font-size:12px;margin-top:7px;line-height:1.55}.score{display:inline-block;margin-top:12px;background:#2b2140;padding:5px 7px;border-radius:6px;font-size:11px;font-weight:800}
 .empty{margin-top:28px;padding:28px;border:1px dashed #383842;border-radius:13px;color:var(--muted);text-align:center}
-.modal{position:fixed;inset:0;background:#000b;display:none;align-items:center;justify-content:center;padding:18px;z-index:30}.modal.show{display:flex}.sheet{width:min(820px,100%);max-height:90vh;overflow:auto;background:#18181b;border:1px solid #373740;border-radius:16px;padding:22px;box-shadow:0 30px 100px #000}.sheetTop{display:flex;justify-content:space-between;gap:20px}.sheet h2{margin:0;font-size:25px}.close{background:#2f2f35;border:0;color:white;width:36px;height:36px;border-radius:9px;cursor:pointer}.pills{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.pill{background:#29292f;border-radius:999px;padding:6px 9px;font-size:11px;color:#d4d4dc}.plot{line-height:1.65;color:#d6d6dc;margin-top:18px}.episodes{margin-top:22px}.episodes h3{margin:0 0 10px}.ep{padding:11px 0;border-top:1px solid #2c2c33}.epName{font-weight:750}.epMeta{font-size:12px;color:var(--muted);margin-top:4px}.epDesc{font-size:13px;color:#c6c6ce;margin-top:7px;line-height:1.5}
+.modal{position:fixed;inset:0;background:#000b;display:none;align-items:center;justify-content:center;padding:18px;z-index:30}.modal.show{display:flex}.sheet{width:min(820px,100%);max-height:90vh;overflow:auto;background:#18181b;border:1px solid #373740;border-radius:16px;padding:22px;box-shadow:0 30px 100px #000}.sheetTop{display:flex;justify-content:space-between;gap:20px}.sheet h2{margin:0;font-size:25px}.close{background:#2f2f35;border:0;color:white;width:36px;height:36px;border-radius:9px;cursor:pointer}.pills{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.pill{background:#29292f;border-radius:999px;padding:6px 9px;font-size:11px;color:#d4d4dc}.plot{line-height:1.65;color:#d6d6dc;margin-top:18px}.episodes{margin-top:22px}.episodes h3{margin:0 0 10px}.ep{padding:11px 0;border-top:1px solid #2c2c33}.epName{font-weight:750}.epMeta{font-size:12px;color:var(--muted);margin-top:4px}.epDesc{font-size:13px;color:#c6c6ce;margin-top:7px;line-height:1.5}.epActions{margin-top:9px}.playBtn{border:0;border-radius:8px;padding:8px 11px;background:var(--purple);color:#fff;font-weight:800;cursor:pointer}.playBtn:hover{background:var(--purple2)}.playBtn:disabled{opacity:.5;cursor:not-allowed}.playerBox{display:none;margin-top:18px;background:#000;border:1px solid #333;border-radius:12px;overflow:hidden}.playerBox.show{display:block}.playerBox video{display:block;width:100%;aspect-ratio:16/9;background:#000}.playMsg{padding:10px 12px;color:var(--muted);font-size:12px}
 .notice{margin-top:18px;border:1px solid #3b3150;background:#21172f;border-radius:10px;padding:12px 13px;color:#d9c9f8;font-size:12px;line-height:1.5}
 @media(max-width:600px){header{padding:0 13px}.brand span:last-child{display:none}main{padding:20px 12px 50px}.search{grid-template-columns:1fr}.grid{grid-template-columns:1fr 1fr}.card{padding:12px}.title{font-size:15px}}@media(max-width:420px){.grid{grid-template-columns:1fr}}
 </style>
@@ -722,14 +824,74 @@ main{max-width:1180px;margin:auto;padding:28px 20px 60px}.hero h1{margin:0 0 7px
     <div class="pills" id="dPills"></div>
     <div class="plot" id="dPlot"></div>
     <div id="dTrailer"></div>
+    <div id="dPlay"></div>
+    <div id="catalogPlayer" class="playerBox"><video id="catalogVideo" controls playsinline></video><div id="playMsg" class="playMsg"></div></div>
     <div class="episodes" id="dEpisodes"></div>
-    <div class="notice">Questa sezione usa l'API non ufficiale per ricerca e metadati. Il playback non viene estratto da questa integrazione.</div>
+    <div class="notice">Ricerca e metadati usano la unofficial API. Il tasto Riproduci usa il resolver configurato sul server.</div>
   </div>
 </div>
 
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+let currentDetail=null;
+let catalogHls=null;
+
+function stopCatalogPlayer(){
+  const v=$('catalogVideo');
+  if(catalogHls){catalogHls.destroy();catalogHls=null}
+  v.pause();v.removeAttribute('src');v.load();
+  $('catalogPlayer').classList.remove('show');
+  $('playMsg').textContent='';
+}
+
+function startCatalogVideo(url,label=''){
+  stopCatalogPlayer();
+  const v=$('catalogVideo');
+  $('catalogPlayer').classList.add('show');
+  $('playMsg').textContent=label||'Riproduzione';
+
+  if(v.canPlayType('application/vnd.apple.mpegurl')){
+    v.src=url; v.play().catch(()=>{});
+    return;
+  }
+
+  if(window.Hls&&Hls.isSupported()){
+    catalogHls=new Hls({enableWorker:true,maxBufferLength:30});
+    catalogHls.loadSource(url);
+    catalogHls.attachMedia(v);
+    catalogHls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{}));
+    return;
+  }
+
+  v.src=url; v.play().catch(()=>{});
+}
+
+async function playMedia(ref,season=null,episode=null){
+  try{
+    const params=new URLSearchParams({ref});
+    if(season!==null)params.set('season',season);
+    if(episode!==null)params.set('episode',episode);
+
+    $('playMsg').textContent='Sto preparando la riproduzione…';
+    $('catalogPlayer').classList.add('show');
+
+    const r=await fetch('/api/media/play?'+params.toString(),{cache:'no-store'});
+    const d=await r.json();
+
+    if(!r.ok)throw new Error(d.error||'Playback non disponibile');
+
+    const label=(season!==null&&episode!==null)
+      ? `${d.name||''} · S${String(season).padStart(2,'0')}E${String(episode).padStart(2,'0')}`
+      : (d.name||'Riproduzione');
+
+    startCatalogVideo(d.url,label);
+  }catch(e){
+    $('catalogPlayer').classList.add('show');
+    $('playMsg').textContent=e.message;
+  }
+}
+
 async function checkStatus(){
   try{
     const r=await fetch('/api/sc/status',{cache:'no-store'}), d=await r.json();
@@ -761,7 +923,7 @@ async function searchCatalog(){
 }
 async function openDetail(encoded){
   const ref=decodeURIComponent(encoded); $('modal').classList.add('show');
-  $('dType').textContent=''; $('dName').textContent='Caricamento…'; $('dPills').innerHTML=''; $('dPlot').textContent=''; $('dEpisodes').innerHTML=''; $('dTrailer').innerHTML='';
+  $('dType').textContent=''; $('dName').textContent='Caricamento…'; $('dPills').innerHTML=''; $('dPlot').textContent=''; $('dEpisodes').innerHTML=''; $('dTrailer').innerHTML=''; $('dPlay').innerHTML=''; stopCatalogPlayer();
   try{
     const r=await fetch('/api/sc/detail/'+encodeURIComponent(ref),{cache:'no-store'}), d=await r.json();
     if(!r.ok)throw new Error(d.error||'Errore scheda');
@@ -770,13 +932,30 @@ async function openDetail(encoded){
     if(d.year)pills.push(String(d.year)); if(d.duration)pills.push(d.duration+' min'); if(d.seasons_count)pills.push(d.seasons_count+' stagioni');
     (d.tags||[]).forEach(t=>pills.push(t)); $('dPills').innerHTML=pills.map(p=>`<span class="pill">${esc(p)}</span>`).join('');
     if(d.trailerUrl)$('dTrailer').innerHTML=`<p><a class="btn" target="_blank" rel="noopener" href="${esc(d.trailerUrl)}">Guarda trailer</a></p>`;
+    currentDetail=d;
+
     const eps=d.episodes||[];
+
+    // Film / contenuti senza episodi: tasto Riproduci principale
+    if(!eps.length){
+      $('dPlay').innerHTML=`<p><button class="playBtn" onclick="playMedia('${encodeURIComponent(d.ref)}')">Riproduci</button></p>`;
+    }
+
+    // Serie: un tasto Riproduci per ogni episodio
     if(eps.length){
-      $('dEpisodes').innerHTML='<h3>Episodi</h3>'+eps.map(e=>`<div class="ep"><div class="epName">S${String(e.season??'?').padStart(2,'0')}E${String(e.episode??'?').padStart(2,'0')} · ${esc(e.name||'Episodio')}</div><div class="epMeta">${e.duration?esc(e.duration)+' min':''}</div>${e.description?`<div class="epDesc">${esc(e.description)}</div>`:''}</div>`).join('');
+      $('dEpisodes').innerHTML='<h3>Episodi</h3>'+eps.map(e=>`
+        <div class="ep">
+          <div class="epName">S${String(e.season??'?').padStart(2,'0')}E${String(e.episode??'?').padStart(2,'0')} · ${esc(e.name||'Episodio')}</div>
+          <div class="epMeta">${e.duration?esc(e.duration)+' min':''}</div>
+          ${e.description?`<div class="epDesc">${esc(e.description)}</div>`:''}
+          <div class="epActions">
+            <button class="playBtn" onclick="playMedia('${encodeURIComponent(d.ref)}',${Number.isFinite(Number(e.season))?Number(e.season):'null'},${Number.isFinite(Number(e.episode))?Number(e.episode):'null'})">Riproduci</button>
+          </div>
+        </div>`).join('');
     }
   }catch(e){$('dName').textContent='Errore';$('dPlot').textContent=e.message}
 }
-function closeModal(){$('modal').classList.remove('show')}
+function closeModal(){stopCatalogPlayer();$('modal').classList.remove('show')}
 $('q').addEventListener('keydown',e=>{if(e.key==='Enter')searchCatalog()});
 checkStatus();
 </script>

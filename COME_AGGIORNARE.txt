@@ -1,28 +1,38 @@
-AGGIORNAMENTO STREAMINGCOMMUNITY - CATALOGO
-===========================================
+CRISTIAN TV - PLAYBACK AUTOMATICO PRONTO
+=========================================
 
-1) Sostituisci su GitHub:
-   - server.py
-   - requirements.txt
+COSA HO AGGIUNTO
+- Tasto RIPRODUCI automatico per i film/contenuti senza episodi.
+- Tasto RIPRODUCI su ogni episodio delle serie.
+- Endpoint /api/media/play.
+- Il server carica automaticamente scheda, ID, TMDB/IMDB, stagione ed episodio.
+- Player HLS integrato nella pagina /catalogo.
 
-2) Su Railway apri il servizio > Variables e aggiungi:
-   SC_DOMAIN = [il dominio che usi con streamingcommunity-unofficialapi]
+IMPORTANTE
+La build NON usa get_links() per estrarre stream da StreamingCommunity.
+Il playback passa attraverso un resolver configurabile che devi essere
+autorizzato a usare.
 
-3) Fai Deploy Latest Commit.
+VARIABLE RAILWAY
+PLAYBACK_RESOLVER_URL=https://tuo-resolver.example/resolve
 
-4) Apri:
-   https://TUO-DOMINIO-RAILWAY/catalogo
+Il resolver riceve una POST JSON:
+{
+  "ref": "...",
+  "media_id": "...",
+  "tmdb_id": 123,
+  "imdb_id": "...",
+  "name": "...",
+  "type": "...",
+  "season": 1,
+  "episode": 2
+}
 
-La pagina Twitch rimane invariata e ha un nuovo pulsante "Catalogo".
+e deve rispondere:
+{"url":"https://...m3u8"}
 
-Questa build integra search() e load() della unofficial API:
-- ricerca
-- schede
-- trama
-- anno
-- tag
-- stagioni
-- lista episodi
-- trailer YouTube quando disponibile
-
-Non usa get_links() e non estrae playlist video.
+COME AGGIORNARE
+1. Sostituisci server.py su GitHub.
+2. Mantieni requirements.txt aggiornato.
+3. Fai Deploy Latest Commit su Railway.
+4. Apri /catalogo.
